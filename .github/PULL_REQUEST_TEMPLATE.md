@@ -13,6 +13,8 @@ Fixes #(issue)
 
 ## How Has This Been Tested?
 
+- [ ] Tested conversion with sample PDF files
+- [ ] Verified output Markdown is correct
 - [ ] `npm run build` passes without errors
 
 ## Checklist:
