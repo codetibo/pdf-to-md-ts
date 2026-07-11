@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# `contents: write` is required so the workflow can create GitHub releases.
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -27,3 +31,18 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Creates a GitHub release that mirrors the npm release. Runs independently of
+  # `publish` so a release is produced for the version tag even if publishing to
+  # npm is skipped or fails (e.g. for a retroactive release of an already
+  # published version). The tag (e.g. v0.1.1) matches the npm version (0.1.1).
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Auto-generate release notes from the commits since the previous tag.
+          generate_release_notes: true
