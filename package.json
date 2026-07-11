@@ -1,6 +1,6 @@
 {
   "name": "pdf-to-md-ts",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Convert PDF documents to Markdown — browser & Node.js compatible",
   "author": "codetibo <codetibo@proton.me>",
   "license": "MIT",
