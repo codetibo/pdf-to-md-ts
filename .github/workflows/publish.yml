@@ -27,7 +27,6 @@ jobs:
         run: npm run build:package
 
       - name: Publish to npm
-        working-directory: packages/node-pdf-to-md
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -46,5 +46,10 @@
     "@types/mdast": "^4.0.4",
     "@types/node": "^22.13.10",
     "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:package": "tsc",
+    "prepublishOnly": "npm run build"
   }
 }
