@@ -4,3 +4,11 @@ yarn-error.log
 PUBLISH.md
 $null
 nul
+
+# Test artifacts
+*-tmp.pdf
+
+# Test app
+test-app
+scanned-test.pdf
+comprehensive-test.pdf

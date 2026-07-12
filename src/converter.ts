@@ -3,7 +3,6 @@
  * Extracts text from PDF via pdf.js, analyzes layout, and produces Markdown.
  * Works in both browser and Node.js environments.
  */
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
 import type {
   Root,
   Content,
@@ -21,6 +20,32 @@ import type {
 import { toMarkdown } from 'mdast-util-to-markdown';
 import { gfmToMarkdown } from 'mdast-util-gfm';
 import type { TxtItem, Row, FontStyle, PdfToMarkdownOptions } from './types.js';
+
+// ── Lazy pdfjs import (handles Node.js vs browser builds) ─────────────
+
+// Declare process for Node.js environment detection.
+// This allows isomorphic usage (browser + Node.js) without @types/node.
+declare const process: {
+  versions: { node?: string };
+} | undefined;
+
+let pdfjsModule: { getDocument: Function; GlobalWorkerOptions: { workerSrc: string }; OPS: Record<string, number> } | null = null;
+
+async function getPdfJs(): Promise<{ getDocument: Function; GlobalWorkerOptions: { workerSrc: string }; OPS: Record<string, number> }> {
+  if (!pdfjsModule) {
+    const isNode =
+      typeof process !== 'undefined' &&
+      process.versions != null &&
+      process.versions.node != null;
+    // Use the legacy build in Node.js environments. The main build
+    // requires browser APIs (DOMMatrix, etc.) not available in Node.js.
+    // @ts-ignore
+    pdfjsModule = isNode
+      ? await import('pdfjs-dist/legacy/build/pdf.mjs')
+      : await import('pdfjs-dist');
+  }
+  return pdfjsModule;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 const BULLET_RE = /^[-•◦▪–—*+]\s+/;
@@ -135,6 +160,56 @@ function headingDepth(row: Row, fontStyleMap?: Record<string, FontStyle>): numbe
 
 // ── Inline formatting ──────────────────────────────────────────────────
 
+/**
+ * Convert a single mdast phrasing node to its HTML string representation.
+ * Used to preserve inner formatting (bold, italic, inline code) when wrapping
+ * with decoration tags (underline, overline).
+ */
+function phrasingToHtml(node: PhrasingContent): string {
+  if (node.type === 'text') return escapeHtml((node as MdText).value);
+  if (node.type === 'inlineCode') return '<code>' + escapeHtml((node as any).value) + '</code>';
+  if (node.type === 'strong') return '<strong>' + ((node as any).children as PhrasingContent[]).map(phrasingToHtml).join('') + '</strong>';
+  if (node.type === 'emphasis') return '<em>' + ((node as any).children as PhrasingContent[]).map(phrasingToHtml).join('') + '</em>';
+  if (node.type === 'delete') return '<del>' + ((node as any).children as PhrasingContent[]).map(phrasingToHtml).join('') + '</del>';
+  // Fallback: return plain text value
+  return String((node as any).value ?? '');
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Apply decorations (underline, overline, strikethrough) to a single node.
+ * Decorations are detected from either PDF annotations or graphic lines
+ * in the page's operator list.
+ *
+ * Underline and overline use raw HTML nodes (no native markdown syntax exists).
+ * Strikethrough uses the delete node type (maps to ~~text~~ in GFM).
+ */
+function applyItemDecoration(
+  node: PhrasingContent,
+  t: TxtItem,
+): PhrasingContent {
+  // Underline: wrap in <u> HTML, preserving inner formatting
+  if (t.underline) {
+    node = { type: 'html', value: `<u>${phrasingToHtml(node)}</u>` } as any;
+  }
+  // Overline: wrap in <span> HTML, preserving inner formatting
+  if (t.overline) {
+    node = { type: 'html', value: `<span style="text-decoration: overline">${phrasingToHtml(node)}</span>` } as any;
+  }
+  // Strikethrough: wrap in delete mdast node (serializes to ~~text~~)
+  if (t.strikethrough) {
+    node = { type: 'delete', children: [node] } as any;
+  }
+  return node;
+}
+
 function buildPhrasing(row: Row, fontStyleMap?: Record<string, FontStyle>): PhrasingContent[] {
   if (!row.length) return [];
   const counts: Record<string, number> = {};
@@ -158,6 +233,8 @@ function buildPhrasing(row: Row, fontStyleMap?: Record<string, FontStyle>): Phra
         node = { type: 'strong', children: [node] };
       }
     }
+    // Apply annotation-based decorations (underline, strikethrough)
+    node = applyItemDecoration(node, t);
     if (i > 0 && out.length) out.push({ type: 'text', value: ' ' } as MdText);
     out.push(node);
   }
@@ -179,6 +256,168 @@ function applyStrikethrough(nodes: PhrasingContent[]): PhrasingContent[] {
     } else out.push(node);
   }
   return out;
+}
+
+// ── Decoration detection from page operators (graphic lines) ─────────
+
+/**
+ * Detect underline, overline, and strikethrough by analyzing the page's
+ * drawing operators for horizontal lines positioned near text baselines.
+ *
+ * This handles PDFs where text decorations are rendered as graphic paths
+ * (e.g., PDFs from Word, Google Docs) rather than as PDF annotations.
+ */
+async function detectTextDecorationsFromOperators(
+  page: any,
+  items: TxtItem[],
+): Promise<void> {
+  if (!items.length) return;
+
+  // Skip expensive operator parsing if all items already have decorations
+  const needsDecoration = items.some(t => !t.underline && !t.overline && !t.strikethrough);
+  if (!needsDecoration) return;
+
+  // getOperatorList can be slow on some PDFs; use a timeout
+  const opList = await Promise.race([
+    page.getOperatorList(),
+    new Promise<null>((_, reject) =>
+      setTimeout(() => reject(new Error('getOperatorList timed out')), 10000),
+    ),
+  ]).catch(() => null);
+
+  if (!opList || !opList.fnArray || !opList.fnArray.length) return;
+
+  // Use the actual page width for filtering full-width lines
+  const viewport = page.getViewport({ scale: 1 });
+  const pageWidth = viewport.width;
+
+  // Parse operators to find executed horizontal lines
+  // pdfjs v5.x compiles PDF path operators into constructPath (OPS.constructPath=91)
+  // or individual operators (moveTo=13, lineTo=14, rectangle=19, etc.)
+  const { OPS } = await getPdfJs();
+  const lines: { x1: number; y1: number; x2: number; y2: number }[] = [];
+  let path: { x: number; y: number }[] = [];
+
+  /** Extract horizontal line segments from a subpath object inside constructPath */
+  function extractLinesFromSubpath(subpath: Record<string, number>): void {
+    const keys = Object.keys(subpath).map(Number).sort((a, b) => a - b);
+    let cur: { x: number; y: number } | null = null;
+    let k = 0;
+    while (k < keys.length) {
+      const flag = subpath[keys[k]];
+      if (flag === 0 || flag === 1) {
+        // moveTo (0) or lineTo (1) — both have (flag, x, y) triplets
+        const x = subpath[keys[k + 1]];
+        const y = subpath[keys[k + 2]];
+        if (flag === 0) {
+          cur = { x, y };
+        } else if (cur !== null && Math.abs(y - cur.y) < 2 && Math.abs(x - cur.x) > 20) {
+          lines.push({ x1: cur.x, y1: cur.y, x2: x, y2: y });
+          cur = { x, y };
+        } else if (flag === 1) {
+          cur = { x, y };
+        }
+        k += 3;
+      } else {
+        // closePath (4) or other flags — single entry
+        if (flag === 4) cur = null;
+        k++;
+      }
+    }
+  }
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn: number = opList.fnArray[i];
+    const args: any = opList.argsArray[i];
+
+    if (fn === OPS.constructPath) {
+      // constructPath bundles path ops: args = [drawingOp, subpaths[], bbox]
+      if (Array.isArray(args[1])) {
+        for (const subpath of args[1]) {
+          if (subpath && typeof subpath === 'object') {
+            extractLinesFromSubpath(subpath);
+          }
+        }
+      }
+    } else if (fn === OPS.moveTo) {
+      path = [{ x: args[0], y: args[1] }];
+    } else if (fn === OPS.lineTo && path.length > 0) {
+      const prev = path[path.length - 1];
+      const x2 = args[0], y2 = args[1];
+      if (Math.abs(y2 - prev.y) < 2 && Math.abs(x2 - prev.x) > 20) {
+        lines.push({ x1: prev.x, y1: prev.y, x2, y2 });
+      }
+      path.push({ x: x2, y: y2 });
+    } else if (fn === OPS.rectangle) {
+      const [rx, ry, rw, rh] = args;
+      if (rh < 3 && rw > 20) {
+        lines.push({ x1: rx, y1: ry, x2: rx + rw, y2: ry + rh });
+      }
+      path = [];
+    } else if (fn === OPS.closePath || fn === OPS.endPath) {
+      path = [];
+    } else if (fn === OPS.stroke || fn === OPS.closeStroke || fn === OPS.fillStroke || fn === OPS.fill) {
+      path = [];
+    }
+  }
+
+  if (!lines.length) return;
+
+  // Filter out lines that span most of the page width (table borders, <hr>)
+  const maxPageSpan = pageWidth * 0.85;
+  const filteredLines = lines.filter(l => (l.x2 - l.x1) < maxPageSpan);
+  if (!filteredLines.length) return;
+
+  // Match each line to nearby text items
+  for (const item of items) {
+    if (item.underline || item.overline || item.strikethrough) continue;
+    if (!item.str.trim()) continue;
+
+    const fs = item.fontSize;
+
+    for (const line of filteredLines) {
+      // Line must overlap horizontally with the text (with tolerance)
+      if (line.x1 > item.x + item.width + 15 || line.x2 < item.x - 15) continue;
+
+      const lineY = (line.y1 + line.y2) / 2;
+      const relY = lineY - item.y; // position relative to text baseline
+
+      if (relY >= fs * 0.75 && relY < fs + 6) {
+        // Overline: line above the text's ascender region
+        item.overline = true;
+        break;
+      } else if (relY >= fs * 0.1 && relY < fs * 0.85) {
+        // Strikethrough: line through the middle of the text
+        item.strikethrough = true;
+        break;
+      } else if (relY >= -6 && relY < fs * 0.1) {
+        // Underline: line at or just below the baseline
+        item.underline = true;
+        break;
+      }
+    }
+  }
+}
+
+// ── Decoration detection from annotations ─────────────────────────────
+
+function applyDecorationFlags(items: TxtItem[], rects: number[][], key: 'underline' | 'strikethrough'): void {
+  if (!rects.length) return;
+  for (const item of items) {
+    if (item[key]) continue;
+    for (const rect of rects) {
+      const [rx1, ry1, rx2, ry2] = rect;
+      if (
+        item.x >= rx1 - 2 &&
+        item.x + item.width <= rx2 + 2 &&
+        item.y >= ry1 - 2 &&
+        item.y + item.fontSize <= ry2 + 2
+      ) {
+        item[key] = true;
+        break;
+      }
+    }
+  }
 }
 
 // ── Link detection from annotations ────────────────────────────────────
@@ -279,11 +518,12 @@ export async function pdfToMarkdown(
   data: ArrayBuffer | Uint8Array,
   options?: PdfToMarkdownOptions,
 ): Promise<string> {
+  const { getDocument, GlobalWorkerOptions } = await getPdfJs();
+
   // Handle environment-specific worker configuration
   const isNode =
     typeof process !== 'undefined' &&
-    process.versions != null &&
-    process.versions.node != null;
+    process?.versions?.node != null;
 
   if (!isNode && typeof self !== 'undefined') {
     // Browser: configure worker
@@ -300,7 +540,10 @@ export async function pdfToMarkdown(
     }
   }
 
-  const pdfData = data instanceof Uint8Array ? data : new Uint8Array(data);
+  // Always create a plain Uint8Array — pdfjs rejects Buffer (Node.js)
+  const pdfData = new Uint8Array(
+    data instanceof ArrayBuffer ? data : (data as Uint8Array),
+  );
   const pdf = await getDocument({ data: pdfData }).promise;
   const children: Content[] = [];
 
@@ -314,9 +557,16 @@ export async function pdfToMarkdown(
 
     // Link rects from annotations
     const linkRects: { url: string; rect: number[] }[] = [];
+    // Decoration rects from annotations
+    const underlineRects: number[][] = [];
+    const strikethroughRects: number[][] = [];
     for (const a of annots) {
       if (a.subtype === 'Link' && (a as any).url && Array.isArray((a as any).rect))
         linkRects.push({ url: (a as any).url as string, rect: (a as any).rect as number[] });
+      if (a.subtype === 'Underline' && Array.isArray((a as any).rect))
+        underlineRects.push((a as any).rect as number[]);
+      if (a.subtype === 'StrikeOut' && Array.isArray((a as any).rect))
+        strikethroughRects.push((a as any).rect as number[]);
     }
 
     // Extract items
@@ -331,11 +581,20 @@ export async function pdfToMarkdown(
           str, x: item.transform?.[4] ?? 0, y: item.transform?.[5] ?? 0,
           fontName: fn, fontSize: fs, width: item.width ?? 0,
           isMono: s?.fontFamily === 'monospace',
+          underline: false, overline: false, strikethrough: false,
         } as TxtItem;
       })
       .filter(Boolean) as TxtItem[];
 
     if (!items.length) continue;
+
+    // Apply decoration flags from annotations (underline, strikethrough)
+    applyDecorationFlags(items, underlineRects, 'underline');
+    applyDecorationFlags(items, strikethroughRects, 'strikethrough');
+
+    // Also detect decorations from page operators (graphic lines near text)
+    // This handles PDFs without annotations (e.g., from Word, Google Docs)
+    await detectTextDecorationsFromOperators(page, items);
 
     const rows = groupRows(items);
     const fontStyleMap = buildFontStyleMap(items);

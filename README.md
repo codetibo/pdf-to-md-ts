@@ -82,7 +82,9 @@ import type { PdfToMarkdownOptions, TxtItem, Row, FontStyle } from 'pdf-to-md-ts
 | **Blockquotes** | `> ` indented text blocks with mixed content support |
 | **Code Blocks** | Fenced ` ``` ` blocks for monospaced text regions |
 | **Inline Code** | `` `code` `` for monospaced inline text |
-| **Strikethrough** | `~~text~~` |
+| **Underline** | `<u>text</u>` via PDF annotations and graphic line detection |
+| **Overline** | `<span style="text-decoration: overline">text</span>` via graphic line detection |
+| **Strikethrough** | `~~text~~` via PDF annotations and graphic line detection |
 | **Hyperlinks** | Detected from PDF link annotations |
 | **Cancellable** | Pass an `AbortSignal` to cancel long conversions |
 
@@ -104,13 +106,19 @@ PDF bytes → pdf.js text extraction → Layout analysis → mdast AST → Markd
    - Blockquotes → X-position indentation
    - Paragraphs → merged consecutive non-special rows
 
-3. **Inline Formatting** — A statistical **width-per-character (WPC)** analysis compares glyph widths across fonts:
+3. **Decoration Detection** — Horizontal graphic lines near text are analyzed to detect text decorations:
+   - Lines above the text → **overline**
+   - Lines through the middle → **strikethrough**
+   - Lines below the baseline → **underline**
+   - PDF annotations (Underline, StrikeOut) are also parsed for decoration detection
+
+4. **Inline Formatting** — A statistical **width-per-character (WPC)** analysis compares glyph widths across fonts:
    - Body text (most common font) → plain
    - Wider glyphs (>3%) → **bold**
    - Narrower glyphs (>15%) → *italic*
    - Between both → ***bold+italic***
 
-4. **Serialization** — The resulting mdast tree is serialized to GFM-compatible Markdown.
+5. **Serialization** — The resulting mdast tree is serialized to GFM-compatible Markdown.
 
 ---
 

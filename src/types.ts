@@ -7,6 +7,12 @@ export type TxtItem = {
   fontSize: number;
   width: number;
   isMono: boolean;
+  /** Whether the text has underline decoration (detected via Underline annotations or graphic lines) */
+  underline: boolean;
+  /** Whether the text has overline decoration (detected via graphic lines above text) */
+  overline: boolean;
+  /** Whether the text has strikethrough decoration (detected via StrikeOut annotations or graphic lines) */
+  strikethrough: boolean;
 };
 
 /** A row of text items grouped by Y-position */
