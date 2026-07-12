@@ -50,7 +50,6 @@
   "scripts": {
     "build": "tsc",
     "build:package": "tsc",
-    "test": "npm run build",
     "prepublishOnly": "npm run build"
   }
 }
